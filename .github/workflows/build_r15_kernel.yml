@@ -1,0 +1,148 @@
+# ============================================================================
+#  R15 (CPH1835 / PACM00, mt6771) kernel build workflow
+#  基于 Winkmoon/android_kernel_xinran_oppo_mt6771 的 build.yml 改造
+#
+#  用法：
+#   1. 先 fork https://github.com/Winkmoon/android_kernel_xinran_oppo_mt6771
+#   2. 把本文件放到 fork 仓库的 .github/workflows/build_r15.yml
+#   3. 把 r15_board_decompiled.dts 放到 fork 仓库根目录
+#   4. Actions -> 生产构建R15 -> Run workflow
+#   5. 下载产物 Kernel_R15-ak3.zip
+#
+#  原理：A9 内核缺的只是 R15 设备树。这里用 A9 的通用 defconfig
+#   (oppo6771_defconfig，含全部 mt6771 驱动) 编出 Image.gz，
+#  再用 dtc 把反解出的 R15 扁平 DTS 编成 dtb，追加到 kernel 尾部，
+#  打成 AnyKernel3 包 —— 只替换 kernel，保留你手机现有 ramdisk。
+#
+#  ⚠ 风险：A9 是 4.14.336，R15 原厂是 4.14.141。同属 4.14 系列，
+#  通用驱动大体兼容，但 MTK 私有驱动（相机/指纹/充电）版本不同，
+#  反解 DTS 的节点属性是按 4.14.141 写的，部分硬件可能失效。必须实机测试。
+# ============================================================================
+name: 生产构建R15
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_VERSION: '4.14'
+  KERNEL_NAME: 'ran-r15'
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_suffix:
+        description: '内核后缀(可选,开头别加连字符)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 最大化构建空间
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: 安装依赖
+        run: |
+          sudo apt update -y
+          sudo apt install -y build-essential flex bison dwarves libssl-dev \
+            libelf-dev bc python3 python-is-python3 make cmake zip curl wget \
+            gnupg ccache rsync binutils-aarch64-linux-gnu device-tree-compiler
+
+      - name: 缓存 LLVM 工具链
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: clang
+          key: llvm-23.1.5-${{ runner.os }}
+      - name: 下载 LLVM 23.1.5
+        run: |
+          if [ ! -d clang ]; then
+            wget -O LLVM.tar.xz https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-X64.tar.xz
+            tar -xvaf LLVM.tar.xz
+            mv LLVM-23.1.5-Linux-X64 clang
+            rm -f LLVM.tar.xz
+          fi
+          echo "CLANG_PATH=$(pwd)/clang" >> $GITHUB_ENV
+          echo "PATH=$(pwd)/clang/bin:$PATH" >> $GITHUB_ENV
+
+      - name: 初始化内核源码
+        run: |
+          git clone --depth=1 https://github.com/Winkmoon/android_kernel_xinran_oppo_mt6771 -b android11 kernel
+          cd kernel
+          rm -f android/abi_gki_protected_exports_*
+          touch .scmversion
+          sed -i 's/^EXTRAVERSION =.*/EXTRAVERSION =/' Makefile
+          cd ..
+
+      - name: 集成 KernelSU
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/rksuorg/KernelSU/main/kernel/setup.sh" | bash -s main
+          echo "CONFIG_KSU=y" >> ./arch/arm64/configs/oppo6771_defconfig
+
+      - name: 设置后缀
+        run: |
+          suffix="${{ inputs.kernel_suffix }}"
+          if [ -n "$suffix" ]; then
+            echo "CONFIG_LOCALVERSION=\"-R15-$suffix\"" >> kernel/arch/arm64/configs/oppo6771_defconfig
+          else
+            echo "CONFIG_LOCALVERSION=\"-R15\"" >> kernel/arch/arm64/configs/oppo6771_defconfig
+          fi
+
+      - name: 编译 Image.gz
+        run: |
+          cd kernel
+          export PATH=$CLANG_PATH/bin:$PATH
+          export CCACHE_DIR=$HOME/.ccache CCACHE_MAXSIZE=2G CCACHE_COMPRESS=true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" HOSTCC="ccache clang" LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip O=out KCFLAGS=-Wno-error \
+            TARGET_PRODUCT=full_oppo6771 oppo6771_defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" HOSTCC="ccache clang" LD=ld.lld \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip O=out KCFLAGS=-Wno-error \
+            TARGET_PRODUCT=full_oppo6771 -j32
+          test -s out/arch/arm64/boot/Image.gz || { echo "::error::Image.gz 缺失"; exit 1; }
+
+      - name: 用 R15 反解 DTS 生成 dtb 并追加到 kernel
+        run: |
+          cd kernel
+          # r15_board_decompiled.dts 由 dtb_to_dts.py 从原机 boot.img 反解得到
+          cp ../r15_board_decompiled.dts ./r15_board.dts
+          dtc -I dts -O dtb -o r15_board.dtb r15_board.dts
+          test -s r15_board.dtb || { echo "::error::dtb 生成失败"; exit 1; }
+          ls -l r15_board.dtb
+          # MTK boot.img 的 kernel 区 = gzip(Image) + 4字节对齐 + appended dtb
+          cat out/arch/arm64/boot/Image.gz > Image.gz-dtb
+          # 4字节对齐
+          SZ=$(stat -c%s Image.gz-dtb)
+          PAD=$(( (SZ + 3) / 4 * 4 ))
+          while [ $(stat -c%s Image.gz-dtb) -lt $PAD ]; do printf '\0' >> Image.gz-dtb; done
+          cat r15_board.dtb >> Image.gz-dtb
+          ls -l Image.gz-dtb
+
+      - name: 打包 AnyKernel3
+        run: |
+          cd kernel
+          git clone https://github.com/Winkmoon/AnyKernel3 --depth=1
+          rm -rf AnyKernel3/.git
+          cd AnyKernel3
+          cp ../Image.gz-dtb ./Image.gz-dtb
+          # 注意：AnyKernel3 只替换 kernel，保留手机现有 ramdisk
+          zip -r ../Kernel_R15-ak3.zip ./*
+          ls -l ../Kernel_R15-ak3.zip
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernel_R15-ak3
+          path: kernel/Kernel_R15-ak3.zip
